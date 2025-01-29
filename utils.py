@@ -6,6 +6,8 @@ def is_valid_filename(filename):
     try:
         if (filename[0:7] != "btcusd-"):
             return False
+        if (len(filename) != 21):
+            return False
         date_str = filename[7:17] # Extract date pattern from filename
         datetime.strptime(date_str, "%Y-%m-%d")
         return True
