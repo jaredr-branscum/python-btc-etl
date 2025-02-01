@@ -7,6 +7,8 @@ import pandas as pd
 import redis
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -21,6 +23,11 @@ DATA_DIRECTORY = os.getenv("DATA_DIRECTORY", "./dataset-test")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 TABLE_NAME = os.getenv("TABLE_NAME", "bitcoin_stock_data")
+MAX_THREADS = int(os.getenv("MAX_THREADS", 4))
+
+# Dynamically read ENABLE_MULTITHREADING from the environment
+def is_multithreading_enabled():
+    return os.getenv("ENABLE_MULTITHREADING", "False").lower() == "true"
 
 # Initialize logger configuration
 def setup_logger(debug=False):
@@ -41,14 +48,23 @@ logger = setup_logger(debug=os.getenv("DEBUG", "False").lower() == "true")
 # Create database connection
 engine = create_engine(DB_URI, pool_pre_ping=True, pool_size=10, max_overflow=20)
 
-# Connect to Redis
-try:
-    r = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
-    r.ping()  # Check if Redis is available
-    logger.info("Connected to Redis successfully")
-except redis.exceptions.ConnectionError:
-    logger.error("Failed to connect to Redis. Ensure Redis is running")
-    exit(1)
+# Thread-local storage for Redis connections
+thread_local = threading.local()
+
+# Get a Redis connection for the current thread.
+# If no connection exists, create a new one.
+def get_redis_connection():
+    if not hasattr(thread_local, "redis_conn"):
+        thread_local.redis_conn = redis.StrictRedis(
+            host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True
+        )
+        try:
+            thread_local.redis_conn.ping()  # Check if Redis is available
+            logger.info(f"Thread {threading.get_ident()} connected to Redis successfully")
+        except redis.exceptions.ConnectionError:
+            logger.error(f"Thread {threading.get_ident()} failed to connect to Redis")
+            raise
+    return thread_local.redis_conn
 
 # Create table that will store bitcoin stock data
 def initialize_database():
@@ -89,23 +105,46 @@ def process_existing_files():
     files = [f for f in os.listdir(DATA_DIRECTORY) if f.endswith('.csv') and is_valid_filename(f)]
     files = sorted(files, key=extract_date_from_filename)  # Sort by extracted date
 
-    for file in files:
-        filepath = os.path.join(DATA_DIRECTORY, file)
-        if not is_processed(r, filepath):
-            process_file(filepath)
-        else:
-            logger.debug(f"{filepath} has already been processed")
+    if is_multithreading_enabled():
+        logger.debug("Running in multithreaded mode.")
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = []
+            for file in files:
+                filepath = os.path.join(DATA_DIRECTORY, file)
+                r = get_redis_connection()
+                if not is_processed(r, filepath):  # Check if file has already been processed
+                    futures.append(executor.submit(process_file, filepath))
+                else:
+                    logger.debug(f"{filepath} has already been processed")
+
+            for future in as_completed(futures):
+                try:
+                    future.result()  # Wait for the task to complete and handle any exceptions
+                except Exception as e:
+                    logger.error(f"Error processing file: {e}")
+    else:
+        logger.debug("Running in non-multithreaded mode.")
+        for file in files:
+            filepath = os.path.join(DATA_DIRECTORY, file)
+            r = get_redis_connection()
+            if not is_processed(r, filepath):
+                process_file(filepath)
+            else:
+                logger.debug(f"{filepath} has already been processed")
     logger.debug("All files have been processed")
 
 # Process single CSV file and store its data
 def process_file(filepath):
-    logger.info(f"Processing file: {filepath}.")
+    thread_id = threading.get_ident()  # Get the current thread's identifier
+    thread_name = threading.current_thread().name  # Get the current thread's name
+    logger.info(f"Thread {thread_name} (ID: {thread_id}) is processing file: {filepath}.")
     try:
         process_file_data(filepath)
+        r = get_redis_connection()
         mark_file_as_processed(r, filepath)
-        logger.info(f"File {filepath} processed successfully")
+        logger.info(f"Thread {thread_name} (ID: {thread_id}) finished processing file: {filepath}.")
     except Exception as e:
-        logger.error(f"Error processing file {filepath}: {e}")
+        logger.error(f"Thread {thread_name} (ID: {thread_id}) encountered an error processing file {filepath}: {e}")
 
 # Perform ETL on CSV file data and store in DB
 def process_file_data(filepath):
@@ -160,6 +199,12 @@ def start_observer(directory):
 
 # File System Event Handler
 class NewFileHandler(FileSystemEventHandler):
+    def __init__(self):
+        if is_multithreading_enabled():
+            self.executor = ThreadPoolExecutor(max_workers=MAX_THREADS)  # Thread pool for processing files
+        else:
+            self.executor = None
+
     # Handles new files detected in directory
     def on_created(self, event):
         logger.debug(f"File event occurred: {event}")
@@ -170,8 +215,13 @@ class NewFileHandler(FileSystemEventHandler):
         filepath = event.src_path
 
         try:
+            r = get_redis_connection()
             if not is_processed(r, filepath):
-                process_file(filepath)
+                if is_multithreading_enabled():
+                    # Submit file processing task to the thread pool
+                    self.executor.submit(process_file, filepath)
+                else:
+                    process_file(filepath)
             else:
                 logger.info(f"Skipping {filepath} that's already processed")
         except Exception as e:

@@ -2,11 +2,13 @@ import pytest
 from unittest.mock import patch, MagicMock
 import pandas as pd
 import warnings
+import threading
+import redis
 
 # Mock Redis globally before importing btc_etl
 with patch("redis.StrictRedis") as mock_redis:
     mock_redis.return_value.ping.return_value = True  # Simulate successful Redis connection
-    from btc_etl import initialize_database, create_hypertable, process_file_data, TABLE_NAME
+    from btc_etl import initialize_database, create_hypertable, process_file_data, get_redis_connection, TABLE_NAME
 
 # ---------------------------
 # FIXTURES FOR REUSABILITY
@@ -108,3 +110,29 @@ def test_process_file_data_missing_time_column(mock_db_connection):
 
     # Ensure no database insertions occurred
     mock_db_connection.execute.assert_not_called()
+
+# ---------------------------
+# TEST REDIS CONNECTION
+# ---------------------------
+
+# Test that get_redis_connection creates a new Redis connection for each thread.
+def test_get_redis_connection():
+    with patch("redis.StrictRedis") as mock_redis:
+        mock_redis.return_value.ping.return_value = True  # Simulate successful Redis connection
+
+        # Simulate two different threads
+        def thread_function():
+            redis_conn = get_redis_connection()
+            assert redis_conn == mock_redis.return_value
+
+        thread1 = threading.Thread(target=thread_function)
+        thread2 = threading.Thread(target=thread_function)
+
+        thread1.start()
+        thread2.start()
+
+        thread1.join()
+        thread2.join()
+
+        # Ensure Redis connection was created for each thread
+        assert mock_redis.call_count == 2
