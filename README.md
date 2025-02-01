@@ -23,7 +23,6 @@ docker run --name redis -p 6379:6379 -d redis
 * Write unit/integration tests
     * Initial unit tests written 1.29.2025
 * Support multi-threading for processing multiple files (Completed 1.31.2025)
-    * Create a queue for ingesting files 
     * Focus on concurrency complexity for preventing threads from picking the same file & sharing a connection pool when interacting with Redis
     * Write performance/benchmarking tests
     * UPDATE 1.31.2025: benchmark tests with test data seems to indicate a 20% or higher performance improvement when using multi-threading with 4 threads
