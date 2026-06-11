@@ -9,12 +9,19 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import queue
 
 from dotenv import load_dotenv
 load_dotenv()
 
 # Import Helper Functions
-from utils import is_valid_filename, extract_date_from_filename, is_processed, mark_file_as_processed
+from utils import (
+    is_valid_filename,
+    extract_date_from_filename,
+    is_processed,
+    mark_file_as_processed,
+    calculate_file_hash
+)
 
 # Load Environment Variable Configurations
 DB_URI = os.getenv("DB_URI", "postgresql://postgres:password@localhost:5432/postgres")
@@ -24,6 +31,13 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 TABLE_NAME = os.getenv("TABLE_NAME", "bitcoin_stock_data")
 MAX_THREADS = int(os.getenv("MAX_THREADS", 4))
+
+# Global variables for Redis connectivity and buffering
+redis_available = True
+redis_lock = threading.Lock()
+redis_retry_queue = queue.Queue()
+offline_processed_cache = set()
+offline_cache_lock = threading.Lock()
 
 # Dynamically read ENABLE_MULTITHREADING from the environment
 def is_multithreading_enabled():
@@ -52,23 +66,111 @@ engine = create_engine(DB_URI, pool_pre_ping=True, pool_size=10, max_overflow=20
 thread_local = threading.local()
 
 # Get a Redis connection for the current thread.
-# If no connection exists, create a new one.
+# Includes retry logic and checks global availability.
 def get_redis_connection():
+    global redis_available
+    with redis_lock:
+        if not redis_available:
+            return None
+
     if not hasattr(thread_local, "redis_conn"):
-        thread_local.redis_conn = redis.StrictRedis(
-            host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True
-        )
+        conn = None
+        retries = 3
+        delay = 1
+        for attempt in range(1, retries + 1):
+            try:
+                conn = redis.StrictRedis(
+                    host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True,
+                    socket_connect_timeout=2, socket_timeout=2
+                )
+                conn.ping()
+                thread_local.redis_conn = conn
+                logger.info(f"Thread {threading.get_ident()} connected to Redis successfully on attempt {attempt}")
+                with redis_lock:
+                    redis_available = True
+                break
+            except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
+                logger.warning(f"Thread {threading.get_ident()} failed to connect to Redis on attempt {attempt}: {e}")
+                if attempt < retries:
+                    time.sleep(delay)
+                    delay *= 2
+        
+        if not hasattr(thread_local, "redis_conn"):
+            with redis_lock:
+                redis_available = False
+            logger.error(f"Thread {threading.get_ident()} failed to connect to Redis after {retries} attempts.")
+            return None
+    else:
+        # Check if existing connection is still alive
         try:
-            thread_local.redis_conn.ping()  # Check if Redis is available
-            logger.info(f"Thread {threading.get_ident()} connected to Redis successfully")
-        except redis.exceptions.ConnectionError:
-            logger.error(f"Thread {threading.get_ident()} failed to connect to Redis")
-            raise
+            thread_local.redis_conn.ping()
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
+            logger.warning(f"Thread {threading.get_ident()}'s existing Redis connection went down.")
+            if hasattr(thread_local, "redis_conn"):
+                delattr(thread_local, "redis_conn")
+            with redis_lock:
+                redis_available = False
+            return None
+
     return thread_local.redis_conn
+
+# Background thread to check and reconnect to Redis, and flush the recovery queue
+def redis_recovery_worker():
+    global redis_available
+    while True:
+        try:
+            time.sleep(5)
+            # Only attempt reconnection if there are items in the queue, or if Redis is marked down
+            if redis_retry_queue.empty() and redis_available:
+                continue
+
+            logger.debug("RedisRecoveryWorker: Checking/Attempting Redis connection...")
+            conn = redis.StrictRedis(
+                host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True,
+                socket_connect_timeout=2, socket_timeout=2
+            )
+            conn.ping()
+
+            # Successfully connected
+            with redis_lock:
+                redis_available = True
+
+            flushed_count = 0
+            while not redis_retry_queue.empty():
+                try:
+                    file_hash = redis_retry_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                try:
+                    conn.sadd('processed_file_hashes', file_hash)
+                    flushed_count += 1
+                    redis_retry_queue.task_done()
+                except Exception as e:
+                    redis_retry_queue.put(file_hash)
+                    logger.error(f"RedisRecoveryWorker failed to write hash {file_hash} to Redis: {e}")
+                    with redis_lock:
+                        redis_available = False
+                    break
+
+            if flushed_count > 0:
+                logger.info(f"RedisRecoveryWorker: Successfully flushed {flushed_count} processed hashes to Redis.")
+
+        except Exception as e:
+            with redis_lock:
+                redis_available = False
+            logger.debug(f"RedisRecoveryWorker: Redis is still unavailable: {e}")
+
+# Helper to start the recovery worker thread
+def start_redis_recovery_worker():
+    worker = threading.Thread(target=redis_recovery_worker, daemon=True, name="RedisRecoveryWorker")
+    worker.start()
+    logger.info("Redis recovery worker thread started successfully.")
+
 
 # Create table that will store bitcoin stock data
 def initialize_database():
-    with engine.connect() as db_conn:
+    with engine.begin() as db_conn:
         db_conn.execute(text(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
             date_time TIMESTAMPTZ PRIMARY KEY,  -- Combined date and time
@@ -111,11 +213,16 @@ def process_existing_files():
             futures = []
             for file in files:
                 filepath = os.path.join(DATA_DIRECTORY, file)
+                try:
+                    file_hash = calculate_file_hash(filepath)
+                except Exception as e:
+                    logger.error(f"Failed to hash file {filepath}: {e}")
+                    continue
                 r = get_redis_connection()
-                if not is_processed(r, filepath):  # Check if file has already been processed
-                    futures.append(executor.submit(process_file, filepath))
+                if not is_processed(r, file_hash, offline_processed_cache):  # Check if file has already been processed
+                    futures.append(executor.submit(process_file, filepath, file_hash))
                 else:
-                    logger.debug(f"{filepath} has already been processed")
+                    logger.debug(f"{filepath} (hash: {file_hash}) has already been processed")
 
             for future in as_completed(futures):
                 try:
@@ -126,22 +233,30 @@ def process_existing_files():
         logger.debug("Running in non-multithreaded mode.")
         for file in files:
             filepath = os.path.join(DATA_DIRECTORY, file)
+            try:
+                file_hash = calculate_file_hash(filepath)
+            except Exception as e:
+                logger.error(f"Failed to hash file {filepath}: {e}")
+                continue
             r = get_redis_connection()
-            if not is_processed(r, filepath):
-                process_file(filepath)
+            if not is_processed(r, file_hash, offline_processed_cache):
+                process_file(filepath, file_hash)
             else:
-                logger.debug(f"{filepath} has already been processed")
+                logger.debug(f"{filepath} (hash: {file_hash}) has already been processed")
     logger.debug("All files have been processed")
 
 # Process single CSV file and store its data
-def process_file(filepath):
+def process_file(filepath, file_hash=None):
     thread_id = threading.get_ident()  # Get the current thread's identifier
     thread_name = threading.current_thread().name  # Get the current thread's name
     logger.info(f"Thread {thread_name} (ID: {thread_id}) is processing file: {filepath}.")
     try:
+        if file_hash is None:
+            file_hash = calculate_file_hash(filepath)
         process_file_data(filepath)
         r = get_redis_connection()
-        mark_file_as_processed(r, filepath)
+        with offline_cache_lock:
+            mark_file_as_processed(r, file_hash, redis_retry_queue, offline_processed_cache)
         logger.info(f"Thread {thread_name} (ID: {thread_id}) finished processing file: {filepath}.")
     except Exception as e:
         logger.error(f"Thread {thread_name} (ID: {thread_id}) encountered an error processing file {filepath}: {e}")
@@ -215,19 +330,26 @@ class NewFileHandler(FileSystemEventHandler):
         filepath = event.src_path
 
         try:
+            filename = os.path.basename(filepath)
+            if not is_valid_filename(filename):
+                logger.info(f"Ignoring file with invalid filename pattern: {filename}")
+                return
+
+            file_hash = calculate_file_hash(filepath)
             r = get_redis_connection()
-            if not is_processed(r, filepath):
+            if not is_processed(r, file_hash, offline_processed_cache):
                 if is_multithreading_enabled():
                     # Submit file processing task to the thread pool
-                    self.executor.submit(process_file, filepath)
+                    self.executor.submit(process_file, filepath, file_hash)
                 else:
-                    process_file(filepath)
+                    process_file(filepath, file_hash)
             else:
                 logger.info(f"Skipping {filepath} that's already processed")
         except Exception as e:
             logger.error(f"Error processing file {filepath}: {e}")
 
 if __name__ == "__main__":
+    start_redis_recovery_worker()
     initialize_database()
     process_existing_files()
     start_observer(DATA_DIRECTORY)

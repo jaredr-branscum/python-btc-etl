@@ -20,13 +20,20 @@ from btc_etl import (
 DATA_DIRECTORY = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "dataset-test"))
 
 def setup_benchmark_environment():
+    # Ensure database table exists before truncating it
+    initialize_database()
+
     # Reset Redis cache
     r = get_redis_connection()
-    r.delete("processed_files")  # Clear the set of processed files
+    if r is not None:
+        r.delete("processed_files")  # Clear the set of processed files
+        r.delete("processed_file_hashes")  # Clear the set of processed file hashes
 
     # Reset database
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         conn.execute(text(f"TRUNCATE TABLE {TABLE_NAME}"))
+
+
 
 def run_benchmark(multithreaded):
     # Set the environment variable for multithreading

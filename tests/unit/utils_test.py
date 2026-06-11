@@ -7,7 +7,11 @@ from utils import (
     extract_date_from_filename,
     is_processed,
     mark_file_as_processed,
+    calculate_file_hash,
 )
+import queue
+import tempfile
+import os
 
 # Test `is_valid_filename`
 @pytest.mark.parametrize("filename, expected", [
@@ -43,28 +47,57 @@ def test_extract_date_from_filename_invalid(invalid_filename):
     with pytest.raises(ValueError):
         extract_date_from_filename(invalid_filename)
 
+# Test `calculate_file_hash`
+def test_calculate_file_hash():
+    import hashlib
+    content = b"test data content for hashing"
+    with tempfile.NamedTemporaryFile(delete=False, mode='wb') as temp:
+        temp.write(content)
+        temp_path = temp.name
+    try:
+        expected_hash = hashlib.sha256(content).hexdigest()
+        assert calculate_file_hash(temp_path) == expected_hash
+    finally:
+        os.remove(temp_path)
+
+
 # Test `is_processed`
 def test_is_processed():
     mock_redis = MagicMock()
     mock_redis.sismember.return_value = True
-    assert is_processed(mock_redis, 'btcusd-2023-01-01.csv') == True
-    mock_redis.sismember.assert_called_once_with('processed_files', 'btcusd-2023-01-01.csv')
+    assert is_processed(mock_redis, 'dummy_hash') == True
+    mock_redis.sismember.assert_called_once_with('processed_file_hashes', 'dummy_hash')
+
+# Test `is_processed` with offline cache
+def test_is_processed_offline_cache():
+    offline_cache = {'hash_in_cache'}
+    # Even if redis is down/None, checking offline cache should return True
+    assert is_processed(None, 'hash_in_cache', offline_cache) == True
+    assert is_processed(None, 'hash_not_in_cache', offline_cache) == False
 
 # Test `is_processed` with Redis connection error
 def test_is_processed_redis_error():
     mock_redis = MagicMock()
     mock_redis.sismember.side_effect = redis.exceptions.ConnectionError("Redis is down")
-    assert is_processed(mock_redis, 'btcusd-2023-01-01.csv') == False
+    assert is_processed(mock_redis, 'dummy_hash') == False
 
 # Test `mark_file_as_processed`
 def test_mark_file_as_processed():
     mock_redis = MagicMock()
-    mark_file_as_processed(mock_redis, 'btcusd-2023-01-01.csv')
-    mock_redis.sadd.assert_called_once_with('processed_files', 'btcusd-2023-01-01.csv')
+    mark_file_as_processed(mock_redis, 'dummy_hash')
+    mock_redis.sadd.assert_called_once_with('processed_file_hashes', 'dummy_hash')
 
 # Test `mark_file_as_processed` with Redis connection error
 def test_mark_file_as_processed_redis_error():
     mock_redis = MagicMock()
     mock_redis.sadd.side_effect = redis.exceptions.ConnectionError("Redis is down")
-    mark_file_as_processed(mock_redis, 'btcusd-2023-01-01.csv')
-    mock_redis.sadd.assert_called_once_with('processed_files', 'btcusd-2023-01-01.csv')
+    
+    retry_q = queue.Queue()
+    offline_c = set()
+    
+    mark_file_as_processed(mock_redis, 'dummy_hash', retry_q, offline_c)
+    mock_redis.sadd.assert_called_once_with('processed_file_hashes', 'dummy_hash')
+    
+    # Assert that it got buffered offline since Redis was down
+    assert 'dummy_hash' in offline_c
+    assert retry_q.get_nowait() == 'dummy_hash'
